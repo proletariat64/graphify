@@ -5006,6 +5006,17 @@ def dispatch_command(cmd: str) -> None:
                             file=sys.stderr,
                         )
                         sys.exit(1)
+                elif backend == "openai-oauth":
+                    from graphify.openai_oauth import credentials_available
+                    allow_no_key = credentials_available()
+                    if not allow_no_key:
+                        print(
+                            "error: backend 'openai-oauth' requires a ChatGPT subscription "
+                            "OAuth login. Run `python -m graphify.openai_oauth` to log in "
+                            "(device-code flow).",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
                 if not allow_no_key:
                     print(
                         f"error: backend '{backend}' requires {_format_backend_env_keys(backend)} to be set.",

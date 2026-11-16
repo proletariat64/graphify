@@ -260,6 +260,19 @@ BACKENDS: dict[str, dict] = {
         # CLI's Read tool rather than as inline base64 (see `_call_claude_cli`).
         "vision": True,
     },
+    "openai-oauth": {
+        # ChatGPT subscription (Plus/Pro) via the Codex OAuth flow — the OpenAI
+        # analogue of claude-cli. Authenticates with OAuth tokens from
+        # `python -m graphify.openai_oauth` (device-code login), not an API key,
+        # and calls the Codex Responses backend, which is NOT api.openai.com and
+        # rejects token-limit fields. Costs are billed to the subscription.
+        "base_url": os.environ.get("GRAPHIFY_CODEX_BASE_URL", "https://chatgpt.com/backend-api"),
+        "default_model": os.environ.get("GRAPHIFY_OPENAI_OAUTH_MODEL", "gpt-6-luna"),
+        "model_env_key": "GRAPHIFY_OPENAI_OAUTH_MODEL",
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": None,
+        "max_tokens": 16384,
+    },
 }
 
 
@@ -1473,6 +1486,12 @@ def _backend_env_keys(backend: str) -> list[str]:
 
 def _get_backend_api_key(backend: str) -> str:
     """Return the first configured API key for backend, or an empty string."""
+    if backend == "openai-oauth":
+        # Keyless backend: a stored OAuth login counts as "configured" so
+        # gates like dedup's LLM tiebreaker don't skip it.
+        from graphify.openai_oauth import credentials_available
+
+        return "openai-oauth" if credentials_available() else ""
     for env_key in _backend_env_keys(backend):
         value = os.environ.get(env_key)
         if value:
@@ -1483,7 +1502,11 @@ def _get_backend_api_key(backend: str) -> str:
 def _format_backend_env_keys(backend: str) -> str:
     """Return user-facing accepted API-key variable names."""
     keys = _backend_env_keys(backend)
-    return " or ".join(keys) if keys else "AWS_PROFILE or AWS_REGION"
+    if keys:
+        return " or ".join(keys)
+    if backend == "openai-oauth":
+        return "a ChatGPT subscription OAuth login (run `python -m graphify.openai_oauth`)"
+    return "AWS_PROFILE or AWS_REGION"
 
 
 def _default_model_for_backend(backend: str) -> str:
@@ -1750,6 +1773,35 @@ def _call_openai_compat(
             "try a larger model with --model (e.g. --model qwen2.5-coder:14b).",
             file=sys.stderr,
         )
+    return result
+
+
+def _call_openai_oauth(
+    model: str,
+    user_message: str,
+    *,
+    deep_mode: bool = False,
+    images: "list | None" = None,
+) -> dict:
+    """ChatGPT-subscription extraction via the Codex Responses backend.
+
+    Independent of _call_openai_compat: subscription OAuth tokens only work on
+    chatgpt.com/backend-api/codex/responses (Responses API, SSE), never on the
+    public OpenAI API. No token-limit fields are sent — the backend rejects them.
+    """
+    from graphify.openai_oauth import call_codex
+
+    if images:
+        user_message = _with_image_notes(user_message, images)
+    raw_content, input_tokens, output_tokens, finish_reason = call_codex(
+        model, _extraction_system(deep=deep_mode), user_message
+    )
+    result = _parse_llm_json(raw_content or "{}")
+    result["input_tokens"] = input_tokens
+    result["output_tokens"] = output_tokens
+    result["model"] = model
+    result["finish_reason"] = finish_reason
+    _mark_hollow(result, raw_content, "openai-oauth")
     return result
 
 
@@ -2267,7 +2319,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "openai-oauth"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -2309,6 +2361,8 @@ def extract_files_direct(
             max_tokens=max_out,
             deep_mode=deep_mode,
         )
+    elif backend == "openai-oauth":
+        result = _call_openai_oauth(mdl, user_msg, deep_mode=deep_mode, images=image_refs)
     else:
         result = _call_openai_compat(
             cfg["base_url"],
@@ -2964,6 +3018,8 @@ def extract_corpus_parallel(
     # over session state. Force serial unless the user explicitly opts in.
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
+    if backend == "openai-oauth" and os.environ.get("GRAPHIFY_OPENAI_OAUTH_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
     # A file split into slices is complete only once every slice has returned
     # (#4943). Checkpointing each slice as it lands stamped the parent's entry
     # complete after its first slice, so an interrupted run served the head of
@@ -3325,7 +3381,7 @@ def _call_llm(
         ollama_url = _resolve_ollama_base_url(cfg.get("base_url", ""))
         _validate_ollama_base_url(ollama_url)
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "openai-oauth"):
         raise ValueError(
             f"No API key for backend '{backend}'. Set {_format_backend_env_keys(backend)}."
         )
@@ -3453,6 +3509,13 @@ def _call_llm(
         if au is not None:
             _rec(getattr(au, "prompt_tokens", 0), getattr(au, "completion_tokens", 0))
         return resp.choices[0].message.content or ""
+
+    if backend == "openai-oauth":
+        from graphify.openai_oauth import call_codex
+
+        text, inp, out, _finish = call_codex(mdl, "You are a helpful assistant.", prompt)
+        _rec(inp, out)
+        return text
 
     # OpenAI-compatible (kimi, openai, gemini, ollama)
     try:
@@ -3691,7 +3754,7 @@ def detect_backend_with_source() -> "tuple[str | None, str]":
         _validate_ollama_base_url(ollama_url)
         return "ollama", "auto-detected from Ollama configuration"
     for name in BACKENDS:
-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli"):
+        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli", "openai-oauth"):
             if _get_backend_api_key(name):
                 env = _first_set_env(_backend_env_keys(name)) or name
                 return name, f"auto-detected from {env}"
@@ -3967,6 +4030,8 @@ def label_communities(
     if backend == "ollama" and os.environ.get("GRAPHIFY_OLLAMA_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
+    if backend == "openai-oauth" and os.environ.get("GRAPHIFY_OPENAI_OAUTH_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     workers = max(1, min(max_concurrency, n_batches))
 
