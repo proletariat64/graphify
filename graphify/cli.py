@@ -13,6 +13,7 @@ import re
 import sys
 import time
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
+from graphify.paths import graph_root_for as _graph_root_for
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
@@ -63,6 +64,17 @@ _READ_NUDGE_STALE = json.dumps({
             'changed after the last build). Prefer `graphify query "<question>"` for '
             'orientation, and run `graphify update` to refresh the graph. Reading the '
             'file directly is fine.'
+        ),
+    }
+}, ensure_ascii=False, separators=(",", ":")) + "\n"
+_SEARCH_NUDGE_STALE = json.dumps({
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "additionalContext": (
+            'graphify-out/graph.json exists but may be STALE (pending changes since '
+            'the last build). Prefer `graphify query "<question>"` for orientation '
+            'once the graph is current; run `graphify update` to refresh it. '
+            'Searching directly is fine.'
         ),
     }
 }, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -218,33 +230,6 @@ def _print_cloud_cta(out_dir: "Path", node_count: int = 0) -> None:
         print("  Free plan, no card: https://app.graphify.com/signup?utm_source=cli&utm_medium=terminal&utm_campaign=oss&utm_content=post-run")
 
 
-def _graph_root_for(gp: Path) -> Path:
-    """Resolve the selected graph's project without interpreting paths via CWD."""
-    from graphify.paths import GRAPHIFY_OUT
-
-    try:
-        text = (gp.parent / ".graphify_root").read_text(encoding="utf-8-sig").strip()
-        if text:
-            root = Path(text)
-            if root.is_absolute():
-                try:
-                    resolved = root.resolve()
-                except RuntimeError:
-                    pass  # Path resolution can report a symlink loop this way.
-                else:
-                    if resolved.is_dir():
-                        return resolved
-    except (OSError, UnicodeError, ValueError):
-        pass
-
-    # CLI-written absolute markers cover shared output. Otherwise strip only
-    # an exact, traversal-free relative output suffix, never a CWD-resolved one.
-    output = Path(GRAPHIFY_OUT)
-    parts = output.parts
-    if (parts and not output.is_absolute() and ".." not in parts
-            and gp.parent.parts[-len(parts):] == parts):
-        return gp.parent.parents[len(parts) - 1]
-    return gp.parent
 
 
 def _default_graph_path() -> str:
@@ -1121,6 +1106,28 @@ def _enforce_graph_size_cap_or_exit(gp: Path) -> None:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+def _load_cli_graph(gp: Path):
+    """Load graph.json as a directed graph for a node-lookup command, or exit 1.
+
+    Directed so stored caller->callee direction survives the load.
+    """
+    from networkx.readwrite import json_graph
+    from graphify.paths import consumed, read_graph_json
+
+    if not gp.exists():
+        print(f"error: graph file not found: {gp}", file=sys.stderr)
+        sys.exit(1)
+    _enforce_graph_size_cap_or_exit(gp)
+    raw = read_graph_json(gp)
+    if "links" not in raw and "edges" in raw:
+        raw = dict(raw, links=raw["edges"])
+    raw = {**raw, "directed": True}
+    raw = dict(raw, nodes=consumed(raw["nodes"]), links=consumed(raw["links"]))
+    return json_graph.node_link_graph(raw, edges="links")
+
+
 def _hook_strict_enabled(flag: bool) -> bool:
     """Resolve strict mode: GRAPHIFY_HOOK_STRICT env overrides the baked-in flag
     (truthy forces on without a reinstall, falsy is the kill switch); unset defers
@@ -1627,6 +1634,23 @@ def _run_hook_guard(kind: str, strict: bool = False) -> None:
             is_bash_search = bool(cmd_str) and _bash_invokes_search(cmd_str)
             if not (is_grep_tool or is_bash_search) or not out_path("graph.json").is_file():
                 return
+            # #5132: unlike Read, the search nudge never checked graph freshness
+            # at all, so an agent kept being pointed at a graph that had gone
+            # stale (e.g. after checking out a much newer commit) with no
+            # softening. needs_update applies corpus-wide, same as Read; a
+            # single-file Grep target additionally gets Read's own per-file
+            # mtime check, since that is exact where Read's isn't available
+            # (a directory target has no one mtime that proves staleness without
+            # a tree walk, which this fail-open, every-tool-call guard must not pay
+            # for). Gated on `indexed` (computed below) the same way the strict
+            # deny already is: an unindexed file has no graph knowledge to go
+            # stale in the first place, so it keeps the plain nudge, not this one.
+            search_stale = False
+            try:
+                if out_path("needs_update").exists():
+                    search_stale = True
+            except Exception:
+                pass
             if is_grep_tool:
                 path = t.get("path", ".")
                 if not isinstance(path, str):
@@ -1651,8 +1675,16 @@ def _run_hook_guard(kind: str, strict: bool = False) -> None:
                         and _mark_session_denied(str(d.get("session_id") or "")):
                     sys.stdout.write(_with_hint(_SEARCH_DENY, terms=_search_hint_terms(t)))
                     return
+                if not search_stale and target.is_file() and indexed:
+                    try:
+                        if os.stat(str(target)).st_mtime > os.stat(str(out_path("graph.json"))).st_mtime \
+                                and not _target_matches_manifest(str(target), root):
+                            search_stale = True
+                    except OSError:
+                        pass
             if not _search_is_outside_project(t) and _nudge_allowed(d):
-                sys.stdout.write(_with_hint(_nudge_for_out(_SEARCH_NUDGE), terms=_search_hint_terms(t)))
+                nudge = _SEARCH_NUDGE_STALE if search_stale else _SEARCH_NUDGE
+                sys.stdout.write(_with_hint(_nudge_for_out(nudge), terms=_search_hint_terms(t)))
         elif kind == "read":
             vals = [str(t.get("file_path") or ""), str(t.get("pattern") or ""), str(t.get("path") or "")]
             tails = [
@@ -2741,7 +2773,6 @@ def dispatch_command(cmd: str) -> None:
             print(_explain_usage)
             return
         from graphify.serve import _confidence_tag, _is_ambiguity_refusal, _resolve_single_node
-        from networkx.readwrite import json_graph
 
         label = sys.argv[2]
         graph_path = _default_graph_path()
@@ -2751,18 +2782,7 @@ def dispatch_command(cmd: str) -> None:
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]
         gp = Path(graph_path).resolve()
-        if not gp.exists():
-            print(f"error: graph file not found: {gp}", file=sys.stderr)
-            sys.exit(1)
-        _enforce_graph_size_cap_or_exit(gp)
-        from graphify.paths import consumed, read_graph_json
-        _raw = read_graph_json(gp)
-        if "links" not in _raw and "edges" in _raw:
-            _raw = dict(_raw, links=_raw["edges"])
-        # Force directed so the renderer can recover stored caller→callee direction.
-        _raw = {**_raw, "directed": True}
-        _raw = dict(_raw, nodes=consumed(_raw["nodes"]), links=consumed(_raw["links"]))
-        G = json_graph.node_link_graph(_raw, edges="links")
+        G = _load_cli_graph(gp)
         nid, refusal = _resolve_single_node(G, label)
         if nid is None:
             print(refusal)
@@ -2860,6 +2880,55 @@ def dispatch_command(cmd: str) -> None:
             corpus=str(gp),
             nodes_returned=len(connections),
         )
+        _touch_query_stamp(gp)
+
+    elif cmd == "section":
+        _section_usage = ('Usage: graphify section "<heading>" | "path/file.md#<heading>" '
+                          '[--max-chars N] [--graph path]')
+        if len(sys.argv) < 3:
+            print(_section_usage, file=sys.stderr)
+            sys.exit(1)
+        if len(sys.argv) == 3 and sys.argv[2] in ("--help", "-h"):
+            print(_section_usage)
+            return
+        from graphify.serve import _is_ambiguity_refusal
+        from graphify.sections import (
+            DEFAULT_MAX_CHARS,
+            format_section,
+            read_section,
+            resolve_section_query,
+            section_root,
+        )
+
+        label = sys.argv[2]
+        graph_path = _default_graph_path()
+        max_chars = DEFAULT_MAX_CHARS
+        args = sys.argv[3:]
+        for i, a in enumerate(args):
+            if a == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]
+            elif a == "--max-chars" and i + 1 < len(args):
+                try:
+                    max_chars = max(1, int(args[i + 1]))
+                except ValueError:
+                    print(f"error: --max-chars needs an integer, got {args[i + 1]!r}",
+                          file=sys.stderr)
+                    sys.exit(1)
+        gp = Path(graph_path).resolve()
+        G = _load_cli_graph(gp)
+        nid, refusal = resolve_section_query(G, label)
+        if nid is None:
+            print(refusal)
+            sys.exit(EXIT_AMBIGUOUS if _is_ambiguity_refusal(refusal) else EXIT_NOT_FOUND)
+        d = G.nodes[nid]
+        section, reason = read_section(d, section_root(gp), max_chars)
+        if section is None:
+            print(reason, file=sys.stderr)
+            sys.exit(1)
+        print(format_section(section, str(d.get("label", nid))))
+        from graphify import querylog
+        querylog.log_query(kind="section", question=label, corpus=str(gp),
+                           nodes_returned=1)
         _touch_query_stamp(gp)
 
     elif cmd == "diagnose":
@@ -4937,6 +5006,17 @@ def dispatch_command(cmd: str) -> None:
                             file=sys.stderr,
                         )
                         sys.exit(1)
+                elif backend == "openai-oauth":
+                    from graphify.openai_oauth import credentials_available
+                    allow_no_key = credentials_available()
+                    if not allow_no_key:
+                        print(
+                            "error: backend 'openai-oauth' requires a ChatGPT subscription "
+                            "OAuth login. Run `python -m graphify.openai_oauth` to log in "
+                            "(device-code flow).",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
                 if not allow_no_key:
                     print(
                         f"error: backend '{backend}' requires {_format_backend_env_keys(backend)} to be set.",
@@ -4979,8 +5059,7 @@ def dispatch_command(cmd: str) -> None:
             # graphify-out/ dir into a project that asked for external output.
             # `root` stays the scanned project so source_file/ids relativize
             # against it; conflating the two basenamed every node (#1941).
-            # One extract() per process here, so free its parse memo when done.
-            ast_kwargs: dict = {"cache_root": out_root, "root": target, "release_parse_memo": True}
+            ast_kwargs: dict = {"cache_root": out_root, "root": target}
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
             # #2437/#2438 (the `graphify update` twin of watch's #2406 fix): an
@@ -5055,7 +5134,7 @@ def dispatch_command(cmd: str) -> None:
                             "_cpp_member_records", "_cpp_lookup", "_cpp_field_positions",
                             "_cpp_type_bindings", "_cpp_include_positions", "_cpp_include_paths",
                             "_rust_impl_key", "_rust_declaration_count",
-                            "_ts_public_twin", "_py_property", "_java_ret",
+                            "_ts_public_twin", "_py_property", "_java_ret", "_java_type",
                             "_ts_fields", "_ts_static_fields",
                             "_py_fixture", "_py_return_type", "_go_fields",
                             "_go_package_path",
@@ -5074,6 +5153,11 @@ def dispatch_command(cmd: str) -> None:
                                     "cpp_conditions",
                                     "ruby_reopened",
                                     "ruby_external_method_owners",
+                                    "type_path",
+                                    "namespace",
+                                    "scope_chain",
+                                    "is_nested_type",
+                                    "is_partial",
                                     # Erlang remote-call resolution keys (#3714):
                                     # an unchanged callee module must keep its
                                     # module/name/arity so `foo:bar()` still
@@ -5083,6 +5167,9 @@ def dispatch_command(cmd: str) -> None:
                                     "module",
                                     "name",
                                     "arity",
+                                    "min_arity",
+                                    "variadic",
+                                    "signature",
                                 )
                                 if key in _metadata
                             }
@@ -5464,6 +5551,7 @@ def dispatch_command(cmd: str) -> None:
             "input_tokens": ast_result.get("input_tokens", 0) + sem_result.get("input_tokens", 0),
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
             "extracted_sources": list(ast_result.get("extracted_sources", [])),
+            "failed_sources": list(ast_result.get("failed_sources", [])),
         }
 
         graph_json_path = graphify_out / "graph.json"
@@ -5479,6 +5567,14 @@ def dispatch_command(cmd: str) -> None:
         # #2543: also drop AST sources that failed (missing optional extra /
         # zero-node anomaly) so they are not frozen as up-to-date.
         _failed_ast_sources = list(ast_result.get("failed_sources") or [])
+        if _failed_ast_sources:
+            _extraction_incomplete = True
+            print(
+                f"[graphify extract] AST extraction incomplete for "
+                f"{len(_failed_ast_sources)} source(s); failed sources will not "
+                "replace saved AST records and remain pending for retry.",
+                file=sys.stderr,
+            )
         # #2879: code files the extractor declined by design this run. They ARE
         # stamped (not failures) but have zero nodes, so the manifest marks the
         # emptiness intentional and the #2543 heal stops re-queuing them.

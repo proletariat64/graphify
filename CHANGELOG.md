@@ -2,6 +2,60 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.112 (unreleased)
+
+- Docs: **python** the README, its translations, CONTRIBUTING, RELEASING, the bug-report template and the ruff/pyright targets now state Python 3.11 as the minimum, matching the floor that shipped in 0.9.111 (#5238, thanks @Deepanshu-Mehta; @Max17190 sent the same fix in #5237).
+
+## 0.9.111 (2026-11-15)
+
+- Change: **packaging** the minimum Python is now 3.11 (was 3.10). Python 3.10 reached end of life in October 2026, and the patched releases of our optional and transitive dependencies no longer ship wheels for it. Raising the floor lets the lockfile move to those patched versions. Installs on Python 3.10 keep resolving to 0.9.110, the last 3.10-compatible release; everyone on 3.11 and up is unaffected.
+- Security: **deps** with 3.10 dropped, the committed lockfile resolves Pillow 13.0.0, filelock 4.2.4 and opentelemetry-api 1.45.2 for every supported interpreter, clearing the open Dependabot advisories against the older pins (Pillow is only pulled in by the optional `svg`/`all` extras, not the core install). This is a dependency and packaging change only; there is no change to extraction behaviour and the AST cache schema is unchanged.
+- Test: **skill** the backtick-substitution runtime tests now skip on bash older than 4.1 instead of running, since they capture `set -x` output through `BASH_XTRACEFD` (added in 4.1) and the trace file stays empty on the bash 3.2 that macOS ships, which both failed the unknown-command control and let the "nothing ran" assertion pass vacuously.
+
+## 0.9.110 (2026-11-15)
+
+- Fix: **python** a call through an aliased import (`from mod import foo as bar; bar()`) is linked from inside a method body and from a decorated function or class def, not just at module level (#5214, thanks @hementhu).
+- Fix: **go** a type's methods declared in an internal `_test.go` file (same `package foo`) fold into the type's package node instead of splitting it and dropping its method-call edges; an external `package foo_test` stays separate (#5209, thanks @Yi-111-a).
+- Fix: **js** a name bound in an enclosing scope and captured into a tracked nested closure no longer fabricates a false `indirect_call` to a same-named corpus function; a genuinely unbound name still resolves (#5217, thanks @Sidreyas).
+- Fix: **sql** a T-SQL procedure that parses structurally (rather than through ERROR recovery) keeps its INSERT/UPDATE/DELETE/SELECT INTO writes, and session temp objects (`#t`, `##t`, `@t`) are skipped (#5146, thanks @sunhouy).
+- Fix: **sql** an Oracle `CREATE PACKAGE`/`PACKAGE BODY`'s member procedures and functions, and their table reads and writes, are recovered instead of yielding only a file node (#5168, thanks @JaynouOliver).
+- Test: **llm** cover non-fragment array siblings and fragment-less arrays in the single-element-array unwrap (#5192 follow-up, thanks @rohanb123).
+- Fix: **extract** nested types get owner-qualified node ids, so same-named nested types under different owners (`Left.Builder` / `Right.Builder`) no longer collapse into one node, and a qualified call (`Outer.Inner.m()`, `Outer::Inner::m()`) resolves through the owner chain; affects C#, Java, Scala, C++ and TypeScript (#5185, thanks @y-src).
+- Fix: **query** a markdown heading can be read as its whole section body (the new `graphify section "<heading>"` command and `get_section` MCP tool), derived from the source file at read time, so the graph and cache are unchanged; paths outside the project are refused (#5166, thanks @nothariharan).
+- Perf: **resolution** Python parse trees are no longer memoized across resolution passes, cutting peak memory by ~1.6-2 GB on mid-size repos (and ~70% on large ones) in exchange for a small re-parse cost on repos under ~2000 files; graph output is byte-identical (thanks @rohit-jsfreaky).
+
+The AST cache schema is bumped to 47; warm caches re-run the affected JS/TS, SQL and nested-type (C#, Java, Scala, C++, TS) extractions.
+
+## 0.9.109 (2026-11-13)
+
+- Fix: **csharp** a non-UTF-8 source file (Windows-1252/UTF-16) that contains a preprocessor directive is decoded before the directive is blanked, so a non-ASCII identifier is no longer cut short and later members are no longer dropped (#5194, thanks @JensD-git).
+- Fix: **csharp** an explicit interface implementation (`void IFoo.Bar()`) is kept out of overload binding and gets its own node, so it no longer collapses with a public `Bar` overload, and calls dispatch to the correct member (#5193, thanks @JensD-git).
+- Fix: **ids** members or functions of one scope whose names differ only by a leading/trailing `_`, or only by case, get distinct node ids instead of one swallowing the other, now in Kotlin (#5206), Swift (#5204), Dart (#5200) and C++ (including a constructor `Foo` vs destructor `~Foo`, and a trailing-underscore `name_`, #5202); a unique public name keeps the plain id and the twins are salted, as already done for Python, C#, Java and PHP (thanks @rohit-jsfreaky).
+- Fix: **llm** when a per-chunk callback raises during parallel extraction, the remaining queued chunks are cancelled instead of continuing to run, so a failed run stops promptly without wasted model calls (#5187, thanks @MaxWang007).
+- Fix: **extract** a per-file AST failure during an incremental build preserves the source's last good AST records instead of deleting them, marks the run incomplete, and clears the file's manifest hash so the next run re-attempts it (#5191, thanks @sdivyanshu90).
+- Fix: **llm** a response carrying two or more independent graph fragments (or a multi-element array) is rejected and retried instead of caching only the first as if complete; a single object, or a single-element array wrapping one valid fragment, is still accepted (#5192, thanks @sdivyanshu90).
+- Fix: **extract** under a symlinked scan root, an in-root file keeps its repo-relative `source_file` instead of collapsing to a bare basename (which merged distinct files into one and emptied the graph); only the parent is resolved, so a file symlink that #2832 keeps distinct still is (#4624, thanks @maruf-asterbyte).
+- Fix: **extract** a variadic parameter references its element type (`xs ...T` in Go, `T... xs` in Java, `params T[]` in C#, `T*` in Scala, `...$xs` in PHP), instead of emitting no type edge (#4638, thanks @madhusudanpatnaik).
+- Fix: **dart** a legacy typedef that returns a function type (`typedef int Function(int) Make();`) is named by its own declared name instead of by `Function` (#4641, thanks @madhusudanpatnaik).
+- Fix: **skill** a file a semantic subagent dispatched but never reported a coverage entry for is treated as unread and re-dispatched, instead of being cached and stamped complete from nodes guessed off its name; the subagent prompt now asks for a coverage entry (0 = never opened) for every file (#2225, thanks @Kalessin-Roke).
+
+The AST cache schema is bumped to 46; warm caches re-run the affected C#, Kotlin, Swift, Dart, C++, Go, Java, Scala and PHP extractions.
+
+## 0.9.108 (2026-11-12)
+
+- Fix: **csharp** a member call on a receiver typed by a lowercase, underscore-prefixed or keyword-like type (`_Pair`, `pair`, a field or primary-constructor parameter so typed) now binds, and a static call like `pair.Create()` resolves; namespace and unknown receivers still fail closed. Classic extension-method calls on `bool`/`char?` receivers also bind (#5174, thanks @JensD-git).
+- Fix: **java** a call through a class-qualified static field (`Service.INSTANCE.get()`, and a chain `Service.INSTANCE.other().m()`) resolves via that field's declared type; a local or parameter that shadows the class name keeps that binding, and an instance field accessed as `Type.field` is not treated as static (#5149, thanks @MaxWang007).
+- Fix: **sql** a routine body preserves comma joins (`FROM a, b`) so every table is read, and keeps a `@dblink` suffix as a distinct remote node instead of pointing the edge at a local same-named table (#5169, thanks @mohitdixit02).
+- Fix: **sql** an unparsed derived table's alias (`FROM (SELECT ...) q` where the subquery fails to parse) is no longer mis-read as a table node; a real table after the subquery is unaffected (#5147, thanks @Yi-111-a).
+- Fix: **path** `graphify path` prefers a route through real files over one that detours through a sourceless import hub (an external or stdlib module stub) when both are equally short and confident; when the only route is via a hub it is still returned (#5153, thanks @ayushcodes10).
+- Fix: **report** GRAPH_REPORT.md keeps the extraction token cost from cost.json after a `graphify update`, instead of resetting it to zero on the AST-only rebuild path (#5154, thanks @kevin9327).
+- Fix: **hooks** the search nudge softens when the graph may be stale (pending changes since the last build), mirroring the read nudge, instead of always telling the agent to query the graph; a genuinely unindexed file still gets the plain nudge (#5132, thanks @ayushcodes10).
+- Fix: **serve** a graph reload no longer stalls every MCP request: the new graph is built off to the side and swapped in atomically, so concurrent requests keep being served the current graph instead of blocking for the whole rebuild, and a single in-flight reload is shared rather than rebuilt per waiter (#5177, thanks @ayushcodes10).
+- Fix: **query** a `--context` filter naming a heritage relation (`inherits`, `implements`, `extends`) now reaches heritage edges that carry no context attribute, so the walk follows a class hierarchy instead of stopping at the seed; non-heritage context-less edges are still filtered out, and the header reports when a filter matched no edges (#5178, thanks @sunhouy).
+- Fix: **sql** Oracle `[NON]EDITIONABLE` PROCEDURE/FUNCTION/TRIGGER DDL is recovered from the ERROR node instead of yielding only a file node; a table or routine literally named `editionable`, and non-routine DDL such as `EDITIONABLE VIEW`, are not mis-recovered (#5167, thanks @Yi-111-a).
+
+The AST cache schema is bumped to 45; warm caches re-run the affected C#, Java and SQL extractions.
+
 ## 0.9.107 (2026-11-11)
 
 - Fix: **cpp** a folded parameterless member declaration (`bar()`) records its implementation in `definition_file` as a path anchored to the same root as `source_file`, instead of a `../`-walk relative to the cache/out root. The zero-argument reconciliation added in 0.9.106 stored the internal `_cpp_source_key` proof form, which `_norm_source_file` cannot re-anchor (it only relativizes absolute paths), so an out-of-tree corpus got a mangled `definition_file`. The sibling decl/def merge already stored the raw `source_file` for this reason; both paths now agree. The include-path proof still uses the key form.
@@ -18,7 +72,6 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 - Change: **cloud** the post-build CLI nudge is contextual. It is TTY-only (never in CI or the agent pipeline), respects `GRAPHIFY_NO_TIPS`/`GRAPHIFY_NO_CTA`, and shows on builds 1, 5 and 20 then stays quiet for good. When a local graph reaches 25k nodes, the free plan's per-repo cut-off, the nudge switches to a scale-specific line (tagged `utm_content=scale`) that sells Graphify Pro and links to pricing with the 14-day trial, instead of the free signup: a repo that size no longer fits the free plan, so pointing it at the free plan would land straight on the limit.
 
 The AST cache schema is bumped to 44; warm caches re-run the affected C++, PHP, Java and module-level-id extractions.
-
 ## 0.9.106 (2026-11-10)
 
 - Fix: **install** `requires-python` is capped to `>=3.10,<3.15`, so `uv tool install graphifyy` (and pip) on a fresh machine no longer selects Python 3.15 — for which `tree-sitter` has no wheel — and then fails with a source build that needs a C compiler (`No such file or directory: 'cc'`). uv now picks a wheel-having interpreter (3.14) by default, with no `--python` flag and no compiler needed. The Ubuntu/Debian README line that asked for `python3.12` (absent on Debian 12 and Ubuntu 22.04) is replaced with the uv installer or a plain `python3`/pipx line (#5134).
