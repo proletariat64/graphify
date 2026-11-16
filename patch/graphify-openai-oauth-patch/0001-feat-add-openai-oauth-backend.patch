@@ -1,0 +1,1319 @@
+From 9c8087097d09cb33920e74a68037bb1ec3008503 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=A1=BA=E5=87=AF?= <daishun.ds@antgroup.com>
+Date: Tue, 17 Nov 2026 00:18:35 +0800
+Subject: [PATCH] feat: add openai-oauth backend (ChatGPT subscription via
+ Codex OAuth)
+
+Run graphify extraction on a ChatGPT Plus/Pro subscription instead of
+pay-as-you-go API credit. Subscription OAuth tokens only authenticate
+against the Codex Responses backend (chatgpt.com/backend-api/codex/responses,
+SSE), not api.openai.com, so this adds a dedicated stdlib-only client:
+device-code login (python -m graphify.openai_oauth), isolated credential
+store (~/.graphify/openai-oauth.json, created 0600, fsynced atomic
+pid-unique writes), lock-guarded single-flight refresh with backoff and
+cross-process rotation adoption, JWT chatgpt_account_id extraction, and
+429/5xx/network backoff (incl. mid-stream IncompleteRead). Custom
+User-Agent on every request (Cloudflare 530s Python-urllib's). Handles
+the terminal response.incomplete event; timeouts stay typed as
+TimeoutError; token values never leak into errors.
+
+Covers extract/update semantic extraction (image files become text notes),
+the plain-text path (label), and dedup-llm (credential counts as configured
+key). Default model gpt-6-luna, reasoning effort medium. Serial by default
+like claude-cli; GRAPHIFY_OPENAI_OAUTH_PARALLEL=1 opts in. Never
+auto-detected; select with --backend openai-oauth. Zero new deps.
+---
+ docs/openai-oauth.md       | 101 +++++++
+ graphify/cli.py            |  11 +
+ graphify/llm.py            |  73 ++++-
+ graphify/openai_oauth.py   | 455 ++++++++++++++++++++++++++++++++
+ tests/test_openai_oauth.py | 528 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 1164 insertions(+), 4 deletions(-)
+ create mode 100644 docs/openai-oauth.md
+ create mode 100644 graphify/openai_oauth.py
+ create mode 100644 tests/test_openai_oauth.py
+
+diff --git a/docs/openai-oauth.md b/docs/openai-oauth.md
+new file mode 100644
+index 0000000..81e83a3
+--- /dev/null
++++ b/docs/openai-oauth.md
+@@ -0,0 +1,101 @@
++# openai-oauth backend — use your ChatGPT subscription
++
++The `openai-oauth` backend runs graphify's LLM extraction on a **ChatGPT Plus/Pro
++subscription** instead of pay-as-you-go API credit. It is the OpenAI analogue of
++the `claude-cli` backend.
++
++## How it works
++
++ChatGPT subscription OAuth tokens are **not** API keys: they only authenticate
++against the Codex backend (`https://chatgpt.com/backend-api/codex/responses`),
++which speaks the Responses API over SSE — not the public `api.openai.com`
++chat/completions API. This backend implements that protocol directly (standard
++library only, no extra dependencies), following the same flow as the Codex CLI.
++
++Supported paths: `graphify extract` / `update` (semantic extraction),
++`--dedup-llm` tiebreaker, and `graphify label` (community naming).
++The maintainer-only `graphify prs` triage is not supported.
++
++## 1. Log in once (device-code flow, headless-friendly)
++
++```sh
++python -m graphify.openai_oauth
++```
++
++It prints a URL and a code. Open https://auth.openai.com/codex/device in any
++browser (your laptop is fine — the server needs no browser), sign in to the
++ChatGPT account that has the subscription, and enter the code. Tokens are
++stored in `~/.graphify/openai-oauth.json` (mode 600) and refreshed automatically.
++
++Credentials are **isolated from other OAuth clients** (pi, Codex CLI):
++refresh tokens are single-use, so each client keeps its own login. If you
++already use pi or Codex CLI on the same machine, just log in again here — the
++sessions do not interfere.
++
++## 2. Run graphify
++
++```sh
++graphify extract ./my-project --backend openai-oauth
++# or make it the default for this shell:
++export GRAPHIFY_BACKEND=openai-oauth
++graphify update ./my-project
++graphify label ./my-project --backend openai-oauth
++```
++
++The backend is never auto-detected; select it explicitly with `--backend` or
++`GRAPHIFY_BACKEND`.
++
++Default model: `gpt-6-luna`. Available models depend on your plan (Plus/Pro
++and above); see OpenAI's Codex models page. Override with
++`--model gpt-6.1-sol` or `GRAPHIFY_OPENAI_OAUTH_MODEL`.
++
++## Concurrency
++
++Subscription rate limits are stricter than API limits, so extraction and
++labeling run **serially by default** (like `claude-cli`). To parallelize:
++
++```sh
++GRAPHIFY_OPENAI_OAUTH_PARALLEL=1 graphify extract ./my-project \
++    --backend openai-oauth --max-concurrency 4
++```
++
++429/5xx responses are retried with backoff regardless.
++
++## Environment variables
++
++| Variable | Default | Purpose |
++|---|---|---|
++| `GRAPHIFY_OPENAI_OAUTH_MODEL` | `gpt-6-luna` | Model override |
++| `GRAPHIFY_OPENAI_OAUTH_AUTH_FILE` | `~/.graphify/openai-oauth.json` | Credential store path |
++| `GRAPHIFY_OPENAI_OAUTH_REASONING_EFFORT` | `medium` | Reasoning effort (`low`/`medium`/`high`) |
++| `GRAPHIFY_OPENAI_OAUTH_PARALLEL` | unset (serial) | `1` lifts the serial constraint |
++| `GRAPHIFY_CODEX_BASE_URL` | `https://chatgpt.com/backend-api` | Codex endpoint override (proxies) |
++| `GRAPHIFY_API_TIMEOUT` | `600` | Per-request timeout, seconds |
++| `GRAPHIFY_MAX_RETRIES` | `3` | Retries on 429/5xx/network errors |
++
++## Limitations
++
++- **Text only** (v1): image files are downgraded to text-reference nodes, as
++  with other non-vision backends.
++- Output length is model-governed: the Codex backend rejects `max_tokens`
++  fields, so `--token-budget` still controls *input* chunking but not output caps.
++- Costs report as $0 (subscription-billed); usage token counts are still shown.
++- Request timeouts surface as `TimeoutError` but do not trigger graphify's
++  adaptive chunk-bisection (its classifier only recognizes SDK-specific timeout
++  types). Lower `GRAPHIFY_API_TIMEOUT` if chunks routinely time out.
++- If a refresh fails (revoked session, password change), re-run
++  `python -m graphify.openai_oauth`.
++
++## Applying this as a patch
++
++This feature ships as a standalone patch against official graphify releases:
++
++```sh
++git apply 0001-feat-add-openai-oauth-backend.patch   # in a graphify checkout
++# or: patch -p1 < 0001-feat-add-openai-oauth-backend.patch
++```
++
++After upgrading graphify, re-apply the patch; conflicts (if any) are confined
++to the small hook sites in `graphify/llm.py` and `graphify/cli.py` — the bulk of
++the feature lives in the new files `graphify/openai_oauth.py`,
++`tests/test_openai_oauth.py`, and this document.
+\ No newline at end of file
+diff --git a/graphify/cli.py b/graphify/cli.py
+index 73e2a09..451990a 100644
+--- a/graphify/cli.py
++++ b/graphify/cli.py
+@@ -5006,6 +5006,17 @@ def dispatch_command(cmd: str) -> None:
+                             file=sys.stderr,
+                         )
+                         sys.exit(1)
++                elif backend == "openai-oauth":
++                    from graphify.openai_oauth import credentials_available
++                    allow_no_key = credentials_available()
++                    if not allow_no_key:
++                        print(
++                            "error: backend 'openai-oauth' requires a ChatGPT subscription "
++                            "OAuth login. Run `python -m graphify.openai_oauth` to log in "
++                            "(device-code flow).",
++                            file=sys.stderr,
++                        )
++                        sys.exit(1)
+                 if not allow_no_key:
+                     print(
+                         f"error: backend '{backend}' requires {_format_backend_env_keys(backend)} to be set.",
+diff --git a/graphify/llm.py b/graphify/llm.py
+index 7d4255c..326f972 100644
+--- a/graphify/llm.py
++++ b/graphify/llm.py
+@@ -260,6 +260,19 @@ BACKENDS: dict[str, dict] = {
+         # CLI's Read tool rather than as inline base64 (see `_call_claude_cli`).
+         "vision": True,
+     },
++    "openai-oauth": {
++        # ChatGPT subscription (Plus/Pro) via the Codex OAuth flow — the OpenAI
++        # analogue of claude-cli. Authenticates with OAuth tokens from
++        # `python -m graphify.openai_oauth` (device-code login), not an API key,
++        # and calls the Codex Responses backend, which is NOT api.openai.com and
++        # rejects token-limit fields. Costs are billed to the subscription.
++        "base_url": os.environ.get("GRAPHIFY_CODEX_BASE_URL", "https://chatgpt.com/backend-api"),
++        "default_model": os.environ.get("GRAPHIFY_OPENAI_OAUTH_MODEL", "gpt-6-luna"),
++        "model_env_key": "GRAPHIFY_OPENAI_OAUTH_MODEL",
++        "pricing": {"input": 0.0, "output": 0.0},
++        "temperature": None,
++        "max_tokens": 16384,
++    },
+ }
+ 
+ 
+@@ -1473,6 +1486,12 @@ def _backend_env_keys(backend: str) -> list[str]:
+ 
+ def _get_backend_api_key(backend: str) -> str:
+     """Return the first configured API key for backend, or an empty string."""
++    if backend == "openai-oauth":
++        # Keyless backend: a stored OAuth login counts as "configured" so
++        # gates like dedup's LLM tiebreaker don't skip it.
++        from graphify.openai_oauth import credentials_available
++
++        return "openai-oauth" if credentials_available() else ""
+     for env_key in _backend_env_keys(backend):
+         value = os.environ.get(env_key)
+         if value:
+@@ -1483,7 +1502,11 @@ def _get_backend_api_key(backend: str) -> str:
+ def _format_backend_env_keys(backend: str) -> str:
+     """Return user-facing accepted API-key variable names."""
+     keys = _backend_env_keys(backend)
+-    return " or ".join(keys) if keys else "AWS_PROFILE or AWS_REGION"
++    if keys:
++        return " or ".join(keys)
++    if backend == "openai-oauth":
++        return "a ChatGPT subscription OAuth login (run `python -m graphify.openai_oauth`)"
++    return "AWS_PROFILE or AWS_REGION"
+ 
+ 
+ def _default_model_for_backend(backend: str) -> str:
+@@ -1753,6 +1776,35 @@ def _call_openai_compat(
+     return result
+ 
+ 
++def _call_openai_oauth(
++    model: str,
++    user_message: str,
++    *,
++    deep_mode: bool = False,
++    images: "list | None" = None,
++) -> dict:
++    """ChatGPT-subscription extraction via the Codex Responses backend.
++
++    Independent of _call_openai_compat: subscription OAuth tokens only work on
++    chatgpt.com/backend-api/codex/responses (Responses API, SSE), never on the
++    public OpenAI API. No token-limit fields are sent — the backend rejects them.
++    """
++    from graphify.openai_oauth import call_codex
++
++    if images:
++        user_message = _with_image_notes(user_message, images)
++    raw_content, input_tokens, output_tokens, finish_reason = call_codex(
++        model, _extraction_system(deep=deep_mode), user_message
++    )
++    result = _parse_llm_json(raw_content or "{}")
++    result["input_tokens"] = input_tokens
++    result["output_tokens"] = output_tokens
++    result["model"] = model
++    result["finish_reason"] = finish_reason
++    _mark_hollow(result, raw_content, "openai-oauth")
++    return result
++
++
+ def _claude_prompt_cache_enabled() -> bool:
+     """Keep prompt caching on by default; allow incompatible endpoints to opt out."""
+     raw = os.environ.get("GRAPHIFY_CLAUDE_PROMPT_CACHE", "").strip().lower()
+@@ -2267,7 +2319,7 @@ def extract_files_direct(
+             file=sys.stderr,
+         )
+         key = "ollama"
+-    if not key and backend not in ("bedrock", "claude-cli"):
++    if not key and backend not in ("bedrock", "claude-cli", "openai-oauth"):
+         raise ValueError(
+             f"No API key for backend '{backend}'. "
+             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
+@@ -2309,6 +2361,8 @@ def extract_files_direct(
+             max_tokens=max_out,
+             deep_mode=deep_mode,
+         )
++    elif backend == "openai-oauth":
++        result = _call_openai_oauth(mdl, user_msg, deep_mode=deep_mode, images=image_refs)
+     else:
+         result = _call_openai_compat(
+             cfg["base_url"],
+@@ -2964,6 +3018,8 @@ def extract_corpus_parallel(
+     # over session state. Force serial unless the user explicitly opts in.
+     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+         max_concurrency = 1
++    if backend == "openai-oauth" and os.environ.get("GRAPHIFY_OPENAI_OAUTH_PARALLEL", "").strip() != "1":
++        max_concurrency = 1
+     # A file split into slices is complete only once every slice has returned
+     # (#4943). Checkpointing each slice as it lands stamped the parent's entry
+     # complete after its first slice, so an interrupted run served the head of
+@@ -3325,7 +3381,7 @@ def _call_llm(
+         ollama_url = _resolve_ollama_base_url(cfg.get("base_url", ""))
+         _validate_ollama_base_url(ollama_url)
+         key = "ollama"
+-    if not key and backend not in ("bedrock", "claude-cli"):
++    if not key and backend not in ("bedrock", "claude-cli", "openai-oauth"):
+         raise ValueError(
+             f"No API key for backend '{backend}'. Set {_format_backend_env_keys(backend)}."
+         )
+@@ -3454,6 +3510,13 @@ def _call_llm(
+             _rec(getattr(au, "prompt_tokens", 0), getattr(au, "completion_tokens", 0))
+         return resp.choices[0].message.content or ""
+ 
++    if backend == "openai-oauth":
++        from graphify.openai_oauth import call_codex
++
++        text, inp, out, _finish = call_codex(mdl, "You are a helpful assistant.", prompt)
++        _rec(inp, out)
++        return text
++
+     # OpenAI-compatible (kimi, openai, gemini, ollama)
+     try:
+         from openai import OpenAI
+@@ -3691,7 +3754,7 @@ def detect_backend_with_source() -> "tuple[str | None, str]":
+         _validate_ollama_base_url(ollama_url)
+         return "ollama", "auto-detected from Ollama configuration"
+     for name in BACKENDS:
+-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli"):
++        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli", "openai-oauth"):
+             if _get_backend_api_key(name):
+                 env = _first_set_env(_backend_env_keys(name)) or name
+                 return name, f"auto-detected from {env}"
+@@ -3968,6 +4031,8 @@ def label_communities(
+         max_concurrency = 1
+     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+         max_concurrency = 1
++    if backend == "openai-oauth" and os.environ.get("GRAPHIFY_OPENAI_OAUTH_PARALLEL", "").strip() != "1":
++        max_concurrency = 1
+     workers = max(1, min(max_concurrency, n_batches))
+ 
+     def _run_batch(batch_idx: int):
+diff --git a/graphify/openai_oauth.py b/graphify/openai_oauth.py
+new file mode 100644
+index 0000000..465dfd5
+--- /dev/null
++++ b/graphify/openai_oauth.py
+@@ -0,0 +1,455 @@
++"""OpenAI Codex (ChatGPT subscription) OAuth backend.
++
++Authenticates with the ChatGPT subscription OAuth flow used by the Codex CLI,
++then calls the Codex Responses endpoint
++(``https://chatgpt.com/backend-api/codex/responses``). Subscription tokens are
++NOT valid against api.openai.com — they only work on the Codex backend, which
++speaks the Responses API (not chat/completions) and rejects token-limit fields.
++
++Credentials live in graphify's own store (``~/.graphify/openai-oauth.json``),
++fully isolated from other OAuth clients (pi, Codex CLI): refresh tokens are
++single-use, so sharing a store across clients would let one client's refresh
++invalidate the other's. Log in once with ``python -m graphify.openai_oauth``
++(device-code flow, headless-friendly).
++
++Only the standard library is used (urllib) so this backend adds no dependency.
++"""
++
++from __future__ import annotations
++
++import base64
++import http.client
++import json
++import os
++import sys
++import threading
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++from pathlib import Path
++
++CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
++AUTH_BASE_URL = "https://auth.openai.com"
++TOKEN_URL = f"{AUTH_BASE_URL}/oauth/token"
++DEVICE_USER_CODE_URL = f"{AUTH_BASE_URL}/api/accounts/deviceauth/usercode"
++DEVICE_TOKEN_URL = f"{AUTH_BASE_URL}/api/accounts/deviceauth/token"
++DEVICE_VERIFICATION_URI = f"{AUTH_BASE_URL}/codex/device"
++DEVICE_REDIRECT_URI = f"{AUTH_BASE_URL}/deviceauth/callback"
++DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
++JWT_CLAIM_PATH = "https://api.openai.com/auth"
++DEVICE_CODE_TIMEOUT_SECONDS = 15 * 60
++# Cloudflare rejects the default Python-urllib User-Agent with a 530.
++USER_AGENT = "graphify (python; codex-oauth)"
++# Refresh a little early so a long extraction never straddles the expiry.
++_EXPIRY_SKEW_MS = 60_000
++# Refresh tokens are single-use: parallel workers must not each spend one.
++_REFRESH_LOCK = threading.Lock()
++
++
++def _auth_path() -> Path:
++    override = os.environ.get("GRAPHIFY_OPENAI_OAUTH_AUTH_FILE", "").strip()
++    if override:
++        return Path(override).expanduser()
++    return Path.home() / ".graphify" / "openai-oauth.json"
++
++
++def load_credentials() -> dict | None:
++    """Return the stored credential dict (``access``, ``refresh``, ``expires``)."""
++    try:
++        data = json.loads(_auth_path().read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return None
++    if isinstance(data, dict) and data.get("access") and data.get("refresh"):
++        return data
++    return None
++
++
++def credentials_available() -> bool:
++    return load_credentials() is not None
++
++
++def _write_credentials(cred: dict) -> None:
++    """Persist tokens atomically. Refresh tokens are single-use: the refreshed
++    pair must reach disk reliably, and a torn write must never leave a stale
++    refresh token behind."""
++    path = _auth_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    # Create at 0600 so tokens are never on disk with loose permissions, even
++    # briefly; pid-unique name so concurrent processes don't share a tmp file.
++    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
++    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as fh:
++            fh.write(json.dumps(cred, indent=2))
++            fh.flush()
++            os.fsync(fh.fileno())
++    except Exception:
++        try:
++            os.unlink(tmp)
++        except OSError:
++            pass
++        raise
++    os.replace(tmp, path)
++
++
++def _api_timeout() -> float:
++    raw = os.environ.get("GRAPHIFY_API_TIMEOUT", "").strip()
++    try:
++        value = float(raw)
++        if value > 0:
++            return value
++    except ValueError:
++        pass
++    return 600.0
++
++
++def _max_retries() -> int:
++    raw = os.environ.get("GRAPHIFY_MAX_RETRIES", "").strip()
++    try:
++        value = int(raw)
++        if value >= 0:
++            return value
++    except ValueError:
++        pass
++    return 3
++
++
++def _post_form(url: str, fields: dict[str, str], timeout: float) -> dict:
++    body = urllib.parse.urlencode(fields).encode()
++    req = urllib.request.Request(
++        url,
++        data=body,
++        headers={
++            "Content-Type": "application/x-www-form-urlencoded",
++            "User-Agent": USER_AGENT,
++        },
++        method="POST",
++    )
++    with urllib.request.urlopen(req, timeout=timeout) as resp:
++        return json.loads(resp.read().decode("utf-8"))
++
++
++def _post_json(url: str, payload: dict, timeout: float) -> tuple[int, dict]:
++    req = urllib.request.Request(
++        url,
++        data=json.dumps(payload).encode(),
++        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
++        method="POST",
++    )
++    try:
++        with urllib.request.urlopen(req, timeout=timeout) as resp:
++            return resp.status, json.loads(resp.read().decode("utf-8"))
++    except urllib.error.HTTPError as exc:
++        try:
++            payload_out = json.loads(exc.read().decode("utf-8"))
++        except Exception:
++            payload_out = {}
++        return exc.code, payload_out
++
++
++def _token_response_to_cred(json_data: dict) -> dict:
++    if not json_data.get("access_token") or not json_data.get("refresh_token"):
++        # Never interpolate the payload: a partial response may carry a live
++        # bearer token, and this message ends up in stderr/logs.
++        raise ValueError(
++            "OpenAI token response missing access_token/refresh_token "
++            f"(got keys: {sorted(json_data)})"
++        )
++    return {
++        "access": json_data["access_token"],
++        "refresh": json_data["refresh_token"],
++        "expires": int(time.time() * 1000) + int(json_data.get("expires_in", 3600)) * 1000,
++    }
++
++
++def refresh_credentials(cred: dict) -> dict:
++    max_retries = _max_retries()
++    for attempt in range(max_retries + 1):
++        try:
++            data = _post_form(
++                TOKEN_URL,
++                {
++                    "grant_type": "refresh_token",
++                    "refresh_token": cred["refresh"],
++                    "client_id": CLIENT_ID,
++                },
++                _api_timeout(),
++            )
++            break
++        except urllib.error.HTTPError as exc:
++            if exc.code in (400, 401):
++                # Cross-process race: another graphify process may have spent the
++                # same single-use refresh token and already stored the rotated
++                # pair. Adopt it instead of forcing a re-login.
++                latest = load_credentials()
++                if (
++                    latest is not None
++                    and latest.get("refresh") != cred.get("refresh")
++                    and (latest.get("expires") or 0) - _EXPIRY_SKEW_MS > time.time() * 1000
++                ):
++                    return latest
++            raise ValueError(
++                f"OpenAI OAuth token refresh failed ({exc.code}). The refresh token may be "
++                "revoked or already consumed. Re-login with: python -m graphify.openai_oauth"
++            ) from exc
++        except (urllib.error.URLError, TimeoutError, OSError) as exc:
++            # Refresh runs before call_codex's retry loop, so give transient
++            # network failures the same backoff here.
++            if attempt < max_retries:
++                time.sleep(min(2 ** attempt, 30))
++                continue
++            raise ValueError(f"OpenAI OAuth token refresh failed: {exc}") from exc
++    new_cred = _token_response_to_cred(data)
++    _write_credentials(new_cred)
++    return new_cred
++
++
++def get_access_token() -> str:
++    """Return a valid access token, refreshing and persisting if near expiry."""
++    cred = load_credentials()
++    if cred is None:
++        raise ValueError(
++            "No OpenAI OAuth credentials found. Log in once with "
++            "`python -m graphify.openai_oauth` (device-code flow)."
++        )
++    expires = cred.get("expires") or 0
++    if expires - _EXPIRY_SKEW_MS <= time.time() * 1000:
++        with _REFRESH_LOCK:
++            # Another thread may have refreshed while we waited: re-read before
++            # spending the (single-use) refresh token.
++            latest = load_credentials()
++            if latest is not None and (latest.get("expires") or 0) - _EXPIRY_SKEW_MS > time.time() * 1000:
++                return latest["access"]
++            cred = refresh_credentials(latest or cred)
++    return cred["access"]
++
++
++def account_id_from_token(access: str) -> str:
++    try:
++        payload_b64 = access.split(".")[1]
++        payload_b64 += "=" * (-len(payload_b64) % 4)
++        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
++        account_id = (payload.get(JWT_CLAIM_PATH) or {}).get("chatgpt_account_id")
++        if isinstance(account_id, str) and account_id:
++            return account_id
++    except Exception:
++        pass
++    raise ValueError("Failed to extract chatgpt_account_id from OAuth access token")
++
++
++def _codex_base_url() -> str:
++    raw = os.environ.get("GRAPHIFY_CODEX_BASE_URL", "").strip() or DEFAULT_CODEX_BASE_URL
++    normalized = raw.rstrip("/")
++    if normalized.endswith("/codex/responses"):
++        return normalized
++    if normalized.endswith("/codex"):
++        return f"{normalized}/responses"
++    return f"{normalized}/codex/responses"
++
++
++def _reasoning_effort() -> str:
++    return os.environ.get("GRAPHIFY_OPENAI_OAUTH_REASONING_EFFORT", "").strip() or "medium"
++
++
++def _sse_events(resp):
++    """Yield ``(event, data)`` pairs from an SSE byte stream."""
++    event = ""
++    data_lines: list[str] = []
++    for raw_line in resp:
++        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
++        if line.startswith("event:"):
++            event = line[len("event:"):].strip()
++        elif line.startswith("data:"):
++            data_lines.append(line[len("data:"):].strip())
++        elif not line:
++            if data_lines:
++                data = "\n".join(data_lines)
++                try:
++                    yield event, json.loads(data)
++                except ValueError:
++                    yield event, {"_raw": data}
++            event = ""
++            data_lines = []
++    if data_lines:
++        data = "\n".join(data_lines)
++        try:
++            yield event, json.loads(data)
++        except ValueError:
++            yield event, {"_raw": data}
++
++
++def call_codex(
++    model: str,
++    system: str,
++    user_message: str,
++    *,
++    access_token: str | None = None,
++) -> tuple[str, int, int, str]:
++    """One-shot Codex Responses call. Returns ``(text, input_tokens, output_tokens, finish_reason)``.
++
++    The subscription backend rejects ``max_tokens``/``max_output_tokens`` and
++    ``metadata``; none are sent. Output length is governed by the model itself.
++    """
++    token = access_token or get_access_token()
++    account_id = account_id_from_token(token)
++    body = {
++        "model": model,
++        "store": False,
++        "stream": True,
++        "instructions": system or "You are a helpful assistant.",
++        "input": [
++            {"role": "user", "content": [{"type": "input_text", "text": user_message}]}
++        ],
++        "text": {"verbosity": "low"},
++        "reasoning": {"effort": _reasoning_effort()},
++    }
++    headers = {
++        "Authorization": f"Bearer {token}",
++        "chatgpt-account-id": account_id,
++        "originator": "graphify",
++        "OpenAI-Beta": "responses=experimental",
++        "accept": "text/event-stream",
++        "content-type": "application/json",
++        "User-Agent": USER_AGENT,
++    }
++    url = _codex_base_url()
++    timeout = _api_timeout()
++    max_retries = _max_retries()
++    payload = json.dumps(body).encode()
++
++    for attempt in range(max_retries + 1):
++        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
++        try:
++            with urllib.request.urlopen(req, timeout=timeout) as resp:
++                return _consume_sse(resp)
++        except urllib.error.HTTPError as exc:
++            detail = ""
++            try:
++                detail = exc.read().decode("utf-8", errors="replace")[:500]
++            except Exception:
++                pass
++            if exc.code in (429, 500, 502, 503, 504) and attempt < max_retries:
++                retry_after = exc.headers.get("retry-after") if exc.headers else None
++                try:
++                    delay = float(retry_after) if retry_after else min(2 ** attempt, 30)
++                except ValueError:
++                    delay = min(2 ** attempt, 30)
++                time.sleep(delay)
++                continue
++            if exc.code == 401:
++                raise ValueError(
++                    "Codex backend rejected the OAuth token (401). Re-login with "
++                    "`python -m graphify.openai_oauth`."
++                ) from exc
++            raise ValueError(f"Codex backend HTTP {exc.code}: {detail}") from exc
++        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
++            if attempt < max_retries:
++                time.sleep(min(2 ** attempt, 30))
++                continue
++            # Keep timeouts typed. Note: graphify's bisection classifier only
++            # matches SDK-specific timeout types, so these do not trigger
++            # chunk bisection (documented limitation).
++            timed_out = isinstance(exc, TimeoutError) or (
++                isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)
++            )
++            if timed_out:
++                raise TimeoutError(f"Codex backend request timed out after {timeout}s") from exc
++            raise ValueError(f"Codex backend request failed: {exc}") from exc
++
++
++def _consume_sse(resp) -> tuple[str, int, int, str]:
++    text_parts: list[str] = []
++    item_texts: list[str] = []
++    input_tokens = 0
++    output_tokens = 0
++    finish_reason = "stop"
++    completed = False
++    for event, data in _sse_events(resp):
++        if event == "response.output_text.delta":
++            delta = data.get("delta")
++            if isinstance(delta, str):
++                text_parts.append(delta)
++        elif event == "response.output_item.done":
++            item = data.get("item") or {}
++            if item.get("type") == "message":
++                for part in item.get("content") or []:
++                    if part.get("type") == "output_text" and isinstance(part.get("text"), str):
++                        item_texts.append(part["text"])
++        elif event in ("response.completed", "response.incomplete"):
++            completed = True
++            response = data.get("response") or {}
++            usage = response.get("usage") or {}
++            input_tokens = usage.get("input_tokens") or 0
++            output_tokens = usage.get("output_tokens") or 0
++            if event == "response.incomplete" or response.get("status") == "incomplete":
++                reason = (response.get("incomplete_details") or {}).get("reason")
++                finish_reason = "length" if reason == "max_output_tokens" else "stop"
++        elif event == "response.failed":
++            response = data.get("response") or {}
++            error = response.get("error") or {}
++            raise ValueError(f"Codex response failed: {error.get('message') or error or data}")
++        elif event == "error":
++            raise ValueError(f"Codex stream error: {data.get('message') or data}")
++    text = "".join(text_parts) or "".join(item_texts)
++    if not completed and not text:
++        raise ValueError("Codex stream ended without a completed response or text")
++    return text, input_tokens, output_tokens, finish_reason
++
++
++def login_device_code() -> dict:
++    """Headless device-code login. Prints the URL + code, polls, stores tokens."""
++    timeout = _api_timeout()
++    status, data = _post_json(DEVICE_USER_CODE_URL, {"client_id": CLIENT_ID}, timeout)
++    if status != 200 or not data.get("device_auth_id") or not data.get("user_code"):
++        raise ValueError(f"Device code request failed ({status}): {data}")
++    interval = data.get("interval")
++    interval = float(interval.strip() if isinstance(interval, str) else interval or 5)
++    print(
++        f"\nOpen {DEVICE_VERIFICATION_URI} in a browser and enter code: {data['user_code']}\n",
++        file=sys.stderr,
++        flush=True,
++    )
++    deadline = time.time() + DEVICE_CODE_TIMEOUT_SECONDS
++    authorization_code = code_verifier = None
++    while time.time() < deadline:
++        time.sleep(max(interval, 1))
++        status, token_data = _post_json(
++            DEVICE_TOKEN_URL,
++            {"device_auth_id": data["device_auth_id"], "user_code": data["user_code"]},
++            timeout,
++        )
++        if status == 200 and token_data.get("authorization_code"):
++            authorization_code = token_data["authorization_code"]
++            code_verifier = token_data.get("code_verifier")
++            break
++        error = token_data.get("error")
++        error_code = error.get("code") if isinstance(error, dict) else error
++        if status in (403, 404) or error_code == "deviceauth_authorization_pending":
++            continue
++        if error_code == "slow_down":
++            interval += 5
++            continue
++        raise ValueError(f"Device auth failed ({status}): {token_data}")
++    if not authorization_code:
++        raise ValueError("Device code login timed out")
++    exchanged = _post_form(
++        TOKEN_URL,
++        {
++            "grant_type": "authorization_code",
++            "client_id": CLIENT_ID,
++            "code": authorization_code,
++            "code_verifier": code_verifier or "",
++            "redirect_uri": DEVICE_REDIRECT_URI,
++        },
++        timeout,
++    )
++    cred = _token_response_to_cred(exchanged)
++    account_id_from_token(cred["access"])  # validate claim presence early
++    _write_credentials(cred)
++    print(f"[graphify] OpenAI OAuth credentials saved to {_auth_path()}", file=sys.stderr)
++    return cred
++
++
++if __name__ == "__main__":
++    login_device_code()
+\ No newline at end of file
+diff --git a/tests/test_openai_oauth.py b/tests/test_openai_oauth.py
+new file mode 100644
+index 0000000..537b807
+--- /dev/null
++++ b/tests/test_openai_oauth.py
+@@ -0,0 +1,528 @@
++"""Tests for the openai-oauth (ChatGPT subscription / Codex) backend."""
++
++import base64
++import io
++import json
++import time
++import urllib.error
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++
++from graphify import llm, openai_oauth
++
++
++def _make_jwt(account_id="acct-123"):
++    payload = {openai_oauth.JWT_CLAIM_PATH: {"chatgpt_account_id": account_id}}
++    b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
++    return f"header.{b64}.signature"
++
++
++def _cred(access=None, refresh="refresh-1", expires=None):
++    return {
++        "access": access or _make_jwt(),
++        "refresh": refresh,
++        "expires": expires if expires is not None else int(time.time() * 1000) + 3600_000,
++    }
++
++
++@pytest.fixture(autouse=True)
++def _isolate_env(monkeypatch, tmp_path):
++    for key in (
++        "GRAPHIFY_OPENAI_OAUTH_AUTH_FILE",
++        "GRAPHIFY_CODEX_BASE_URL",
++        "GRAPHIFY_OPENAI_OAUTH_MODEL",
++        "GRAPHIFY_OPENAI_OAUTH_REASONING_EFFORT",
++        "GRAPHIFY_OPENAI_OAUTH_PARALLEL",
++        "GRAPHIFY_API_TIMEOUT",
++        "GRAPHIFY_MAX_RETRIES",
++    ):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("GRAPHIFY_OPENAI_OAUTH_AUTH_FILE", str(tmp_path / "oauth.json"))
++
++
++def _store(cred):
++    Path(openai_oauth._auth_path()).write_text(json.dumps(cred), encoding="utf-8")
++
++
++def _sse_bytes(events):
++    out = []
++    for event, data in events:
++        out.append(f"event: {event}\ndata: {json.dumps(data)}\n\n")
++    return "".join(out).encode()
++
++
++class _FakeResponse(io.BytesIO):
++    status = 200
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *args):
++        self.close()
++        return False
++
++
++def _completed_event(input_tokens=10, output_tokens=20, status="completed", reason=None):
++    response = {"usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}, "status": status}
++    if reason:
++        response["incomplete_details"] = {"reason": reason}
++    return ("response.completed", {"response": response})
++
++
++# ---------------------------------------------------------------- credentials
++
++def test_account_id_from_jwt():
++    assert openai_oauth.account_id_from_token(_make_jwt("acct-xyz")) == "acct-xyz"
++
++
++def test_account_id_missing_claim_raises():
++    b64 = base64.urlsafe_b64encode(json.dumps({"sub": "u"}).encode()).decode().rstrip("=")
++    with pytest.raises(ValueError, match="chatgpt_account_id"):
++        openai_oauth.account_id_from_token(f"h.{b64}.s")
++
++
++def test_account_id_garbage_token_raises():
++    with pytest.raises(ValueError):
++        openai_oauth.account_id_from_token("not-a-jwt")
++
++
++def test_load_credentials_missing_file():
++    assert openai_oauth.load_credentials() is None
++    assert openai_oauth.credentials_available() is False
++
++
++def test_load_credentials_roundtrip():
++    cred = _cred()
++    _store(cred)
++    assert openai_oauth.load_credentials() == cred
++    assert openai_oauth.credentials_available() is True
++
++
++def test_load_credentials_rejects_incomplete():
++    Path(openai_oauth._auth_path()).write_text('{"access": "a"}', encoding="utf-8")
++    assert openai_oauth.load_credentials() is None
++
++
++def test_write_credentials_atomic_and_private():
++    openai_oauth._write_credentials(_cred())
++    path = Path(openai_oauth._auth_path())
++    assert json.loads(path.read_text())["refresh"] == "refresh-1"
++    assert not list(path.parent.glob("*.tmp"))
++    assert (path.stat().st_mode & 0o777) == 0o600
++
++
++def test_get_access_token_no_credentials():
++    with pytest.raises(ValueError, match="python -m graphify.openai_oauth"):
++        openai_oauth.get_access_token()
++
++
++def test_get_access_token_fresh_skips_refresh():
++    _store(_cred())
++    with patch.object(openai_oauth, "_post_form") as post:
++        token = openai_oauth.get_access_token()
++    post.assert_not_called()
++    assert token == _make_jwt()
++
++
++def test_get_access_token_expired_refreshes_and_persists():
++    _store(_cred(expires=int(time.time() * 1000) - 1000))
++    new_access = _make_jwt("acct-new")
++    response = {"access_token": new_access, "refresh_token": "refresh-2", "expires_in": 3600}
++    with patch.object(openai_oauth, "_post_form", return_value=response) as post:
++        token = openai_oauth.get_access_token()
++    assert token == new_access
++    fields = post.call_args[0][1]
++    assert fields["grant_type"] == "refresh_token"
++    assert fields["refresh_token"] == "refresh-1"
++    assert fields["client_id"] == openai_oauth.CLIENT_ID
++    stored = json.loads(Path(openai_oauth._auth_path()).read_text())
++    assert stored["refresh"] == "refresh-2"
++    assert stored["access"] == new_access
++
++
++def test_refresh_failure_mentions_relogin():
++    _store(_cred(expires=0))
++    err = urllib.error.HTTPError(openai_oauth.TOKEN_URL, 400, "Bad Request", {}, None)
++    with patch.object(openai_oauth, "_post_form", side_effect=err):
++        with pytest.raises(ValueError, match="Re-login"):
++            openai_oauth.get_access_token()
++
++
++def test_refresh_400_adopts_other_process_rotation():
++    _store(_cred(expires=int(time.time() * 1000) - 1000))
++    winner_access = _make_jwt("acct-winner")
++
++    def race_then_fail(url, fields, timeout):
++        # Simulate the winning process storing its rotated pair first.
++        _store(_cred(access=winner_access, refresh="refresh-winner"))
++        raise urllib.error.HTTPError(openai_oauth.TOKEN_URL, 400, "Bad Request", {}, None)
++
++    with patch.object(openai_oauth, "_post_form", side_effect=race_then_fail):
++        assert openai_oauth.get_access_token() == winner_access
++
++
++def test_token_error_never_leaks_token_value():
++    with pytest.raises(ValueError) as ei:
++        openai_oauth._token_response_to_cred({"access_token": "SECRET-BEARER"})
++    assert "SECRET-BEARER" not in str(ei.value)
++    assert "access_token" in str(ei.value)
++
++
++def test_parallel_refresh_spends_token_once():
++    import threading
++
++    _store(_cred(expires=int(time.time() * 1000) - 1000))
++    new_access = _make_jwt("acct-race")
++    response = {"access_token": new_access, "refresh_token": "refresh-2", "expires_in": 3600}
++    barrier = threading.Barrier(4)
++    results = []
++
++    def worker():
++        barrier.wait()
++        results.append(openai_oauth.get_access_token())
++
++    with patch.object(openai_oauth, "_post_form", return_value=response) as post:
++        threads = [threading.Thread(target=worker) for _ in range(4)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++    assert post.call_count == 1
++    assert results == [new_access] * 4
++
++
++# ------------------------------------------------------------------ url shape
++
++def test_auth_requests_send_non_default_user_agent():
++    # Cloudflare 530s the default Python-urllib User-Agent.
++    reqs = []
++
++    def fake(req, timeout=None):
++        reqs.append(req)
++        return _FakeResponse(b'{"ok": true}')
++
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        openai_oauth._post_form("https://x", {"a": "b"}, 5)
++        openai_oauth._post_json("https://x", {"a": "b"}, 5)
++    for req in reqs:
++        ua = req.get_header("User-agent")
++        assert ua and "Python-urllib" not in ua
++
++
++@pytest.mark.parametrize("raw,expected", [
++    ("", "https://chatgpt.com/backend-api/codex/responses"),
++    ("https://chatgpt.com/backend-api", "https://chatgpt.com/backend-api/codex/responses"),
++    ("https://chatgpt.com/backend-api/", "https://chatgpt.com/backend-api/codex/responses"),
++    ("https://proxy.example/codex", "https://proxy.example/codex/responses"),
++    ("https://proxy.example/codex/responses", "https://proxy.example/codex/responses"),
++])
++def test_codex_base_url_normalization(monkeypatch, raw, expected):
++    if raw:
++        monkeypatch.setenv("GRAPHIFY_CODEX_BASE_URL", raw)
++    assert openai_oauth._codex_base_url() == expected
++
++
++# ------------------------------------------------------------------ call_codex
++
++@pytest.fixture
++def stored_creds():
++    _store(_cred())
++
++
++def _capture_request(sse_events):
++    """Patch urlopen; return (fake opener, captured dict)."""
++    captured = {}
++
++    def fake_urlopen(req, timeout=None):
++        captured["req"] = req
++        captured["timeout"] = timeout
++        return _FakeResponse(_sse_bytes(sse_events))
++
++    return fake_urlopen, captured
++
++
++def test_call_codex_request_shape(stored_creds):
++    events = [
++        ("response.output_text.delta", {"delta": '{"nodes": []}'}),
++        _completed_event(),
++    ]
++    fake, captured = _capture_request(events)
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        text, inp, out, finish = openai_oauth.call_codex("gpt-6.1-sol", "sys", "hello")
++    assert (text, inp, out, finish) == ('{"nodes": []}', 10, 20, "stop")
++    req = captured["req"]
++    assert req.full_url == "https://chatgpt.com/backend-api/codex/responses"
++    body = json.loads(req.data)
++    assert body["model"] == "gpt-6.1-sol"
++    assert body["store"] is False
++    assert body["stream"] is True
++    assert body["instructions"] == "sys"
++    assert body["reasoning"] == {"effort": "medium"}
++    assert body["input"] == [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
++    # The subscription backend rejects token-limit fields and metadata.
++    for forbidden in ("max_tokens", "max_output_tokens", "max_completion_tokens", "metadata", "temperature"):
++        assert forbidden not in body
++    headers = {k.lower(): v for k, v in req.header_items()}
++    assert headers["authorization"] == f"Bearer {_make_jwt()}"
++    assert headers["chatgpt-account-id"] == "acct-123"
++    assert headers["openai-beta"] == "responses=experimental"
++    assert headers["accept"] == "text/event-stream"
++    assert headers["originator"]
++
++
++def test_call_codex_incomplete_maps_to_length(stored_creds):
++    events = [
++        ("response.output_text.delta", {"delta": "partial"}),
++        _completed_event(status="incomplete", reason="max_output_tokens"),
++    ]
++    fake, _ = _capture_request(events)
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        _, _, _, finish = openai_oauth.call_codex("m", "s", "u")
++    assert finish == "length"
++
++
++def test_call_codex_incomplete_event_maps_to_length(stored_creds):
++    # The real protocol sends truncation as a terminal response.incomplete event.
++    events = [
++        ("response.output_text.delta", {"delta": "partial"}),
++        ("response.incomplete", {"response": {
++            "usage": {"input_tokens": 3, "output_tokens": 4},
++            "incomplete_details": {"reason": "max_output_tokens"},
++        }}),
++    ]
++    fake, _ = _capture_request(events)
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        text, inp, out, finish = openai_oauth.call_codex("m", "s", "u")
++    assert (text, inp, out, finish) == ("partial", 3, 4, "length")
++
++
++def test_call_codex_item_done_fallback(stored_creds):
++    events = [
++        ("response.output_item.done", {"item": {"type": "message", "content": [
++            {"type": "output_text", "text": "fallback text"}]}}),
++        _completed_event(),
++    ]
++    fake, _ = _capture_request(events)
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        text, _, _, _ = openai_oauth.call_codex("m", "s", "u")
++    assert text == "fallback text"
++
++
++def test_call_codex_failed_event_raises(stored_creds):
++    events = [("response.failed", {"response": {"error": {"message": "boom"}}})]
++    fake, _ = _capture_request(events)
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        with pytest.raises(ValueError, match="boom"):
++            openai_oauth.call_codex("m", "s", "u")
++
++
++def test_call_codex_empty_stream_raises(stored_creds):
++    fake, _ = _capture_request([])
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        with pytest.raises(ValueError, match="without a completed response"):
++            openai_oauth.call_codex("m", "s", "u")
++
++
++def test_call_codex_401_raises_relogin(stored_creds):
++    err = urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b"{}"))
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=err):
++        with pytest.raises(ValueError, match="401"):
++            openai_oauth.call_codex("m", "s", "u")
++
++
++def test_call_codex_429_retries_then_succeeds(monkeypatch, stored_creds):
++    monkeypatch.setenv("GRAPHIFY_MAX_RETRIES", "2")
++    events = [("response.output_text.delta", {"delta": "ok"}), _completed_event()]
++    fake, _ = _capture_request(events)
++    err = urllib.error.HTTPError("u", 429, "Too Many Requests", {"retry-after": "0"}, io.BytesIO(b"{}"))
++    retry_resp = _FakeResponse(_sse_bytes(events))
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=[err, retry_resp]) as popen, \
++         patch.object(openai_oauth.time, "sleep") as sleep:
++        text, _, _, _ = openai_oauth.call_codex("m", "s", "u")
++    assert text == "ok"
++    assert popen.call_count == 2
++    sleep.assert_called_once_with(0.0)
++
++
++def test_call_codex_400_no_retry(stored_creds):
++    err = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b'{"detail":"nope"}'))
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=err) as popen:
++        with pytest.raises(ValueError, match="400"):
++            openai_oauth.call_codex("m", "s", "u")
++    assert popen.call_count == 1
++
++
++@pytest.mark.parametrize("exc", [
++    TimeoutError("timed out"),
++    urllib.error.URLError(TimeoutError("timed out")),
++])
++def test_call_codex_timeout_stays_typed(monkeypatch, stored_creds, exc):
++    # graphify's adaptive-bisection layer matches on exception type, so an
++    # exhausted timeout must surface as TimeoutError, not a wrapped ValueError.
++    monkeypatch.setenv("GRAPHIFY_MAX_RETRIES", "0")
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=exc):
++        with pytest.raises(TimeoutError):
++            openai_oauth.call_codex("m", "s", "u")
++
++
++def test_call_codex_network_error_wraps(monkeypatch, stored_creds):
++    monkeypatch.setenv("GRAPHIFY_MAX_RETRIES", "0")
++    err = urllib.error.URLError(ConnectionRefusedError("refused"))
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=err):
++        with pytest.raises(ValueError, match="request failed"):
++            openai_oauth.call_codex("m", "s", "u")
++
++
++def test_call_codex_incomplete_read_retries(monkeypatch, stored_creds):
++    import http.client
++
++    monkeypatch.setenv("GRAPHIFY_MAX_RETRIES", "1")
++    events = [("response.output_text.delta", {"delta": "ok"}), _completed_event()]
++    retry_resp = _FakeResponse(_sse_bytes(events))
++    err = http.client.IncompleteRead(b"partial")
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=[err, retry_resp]) as popen, \
++         patch.object(openai_oauth.time, "sleep"):
++        text, _, _, _ = openai_oauth.call_codex("m", "s", "u")
++    assert text == "ok"
++    assert popen.call_count == 2
++
++
++def test_refresh_network_error_retries(monkeypatch):
++    monkeypatch.setenv("GRAPHIFY_MAX_RETRIES", "1")
++    _store(_cred(expires=int(time.time() * 1000) - 1000))
++    new_access = _make_jwt("acct-net")
++    response = {"access_token": new_access, "refresh_token": "refresh-2", "expires_in": 3600}
++    err = urllib.error.URLError(ConnectionResetError("reset"))
++    with patch.object(openai_oauth, "_post_form", side_effect=[err, response]) as post, \
++         patch.object(openai_oauth.time, "sleep"):
++        assert openai_oauth.get_access_token() == new_access
++    assert post.call_count == 2
++
++
++# ------------------------------------------------------------- llm integration
++
++def test_backend_registered():
++    cfg = llm.BACKENDS["openai-oauth"]
++    assert cfg["pricing"] == {"input": 0.0, "output": 0.0}
++    assert cfg["default_model"] == "gpt-6-luna"
++    assert llm._backend_env_keys("openai-oauth") == []
++    assert llm._backend_supports_vision("openai-oauth") is False
++
++
++def test_model_env_override(monkeypatch):
++    monkeypatch.setenv("GRAPHIFY_OPENAI_OAUTH_MODEL", "gpt-6-luna")
++    assert llm._default_model_for_backend("openai-oauth") == "gpt-6-luna"
++
++
++def test_never_auto_detected(monkeypatch):
++    monkeypatch.setenv("GRAPHIFY_OPENAI_OAUTH_MODEL", "gpt-6.1-sol")
++    _store(_cred())
++    assert llm.detect_backend() is None
++    monkeypatch.setenv("GRAPHIFY_BACKEND", "openai-oauth")
++    assert llm.detect_backend() == "openai-oauth"
++
++
++def test_env_keys_message_mentions_login():
++    assert "python -m graphify.openai_oauth" in llm._format_backend_env_keys("openai-oauth")
++
++
++def test_extract_dispatch(tmp_path, stored_creds):
++    f = tmp_path / "a.py"
++    f.write_text("def foo():\n    pass\n")
++    events = [
++        ("response.output_text.delta", {"delta": '{"nodes": [{"id": "n1", "label": "foo", "type": "function"}], "edges": []}'}),
++        _completed_event(),
++    ]
++    fake, captured = _capture_request(events)
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        result = llm.extract_files_direct([f], backend="openai-oauth", root=tmp_path)
++    assert result["nodes"][0]["label"] == "foo"
++    assert result["input_tokens"] == 10
++    assert result["model"] == "gpt-6-luna"
++    body = json.loads(captured["req"].data)
++    assert "extract" in body["instructions"].lower()
++
++
++def test_extract_no_credentials_raises(tmp_path):
++    f = tmp_path / "a.py"
++    f.write_text("x = 1\n")
++    with pytest.raises(ValueError, match="python -m graphify.openai_oauth"):
++        llm.extract_files_direct([f], backend="openai-oauth", root=tmp_path)
++
++
++def test_extract_image_files_become_text_notes(tmp_path, stored_creds):
++    img = tmp_path / "diagram.png"
++    img.write_bytes(b"\x89PNG\r\n\x1a\nfake")
++    events = [
++        ("response.output_text.delta", {"delta": '{"nodes": [], "edges": []}'}),
++        _completed_event(),
++    ]
++    fake, captured = _capture_request(events)
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        llm.extract_files_direct([img], backend="openai-oauth", root=tmp_path)
++    body = json.loads(captured["req"].data)
++    assert "=== IMAGES ===" in body["input"][0]["content"][0]["text"]
++    assert "diagram.png" in body["input"][0]["content"][0]["text"]
++
++
++def test_api_key_sentinel_tracks_credentials():
++    assert llm._get_backend_api_key("openai-oauth") == ""
++    _store(_cred())
++    assert llm._get_backend_api_key("openai-oauth") != ""
++
++
++def test_llm_text_dispatch(stored_creds):
++    events = [("response.output_text.delta", {"delta": "same concept"}), _completed_event(5, 7)]
++    fake, captured = _capture_request(events)
++    usage = {}
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake):
++        text = llm._call_llm("are these the same?", backend="openai-oauth", usage_out=usage)
++    assert text == "same concept"
++    assert usage == {"input": 5, "output": 7}
++    body = json.loads(captured["req"].data)
++    assert body["input"][0]["content"][0]["text"] == "are these the same?"
++
++
++def _run_parallel(tmp_path, monkeypatch, parallel_env):
++    _store(_cred())
++    files = []
++    for i in range(3):
++        f = tmp_path / f"f{i}.py"
++        f.write_text(f"def fn{i}():\n    pass\n")
++        files.append(f)
++    if parallel_env:
++        monkeypatch.setenv("GRAPHIFY_OPENAI_OAUTH_PARALLEL", "1")
++    def fake_urlopen(req, timeout=None):
++        body = json.loads(req.data)
++        user_text = body["input"][0]["content"][0]["text"]
++        # Per-file nodes so the response is not "hollow" (which would trigger
++        # real retry sleeps in extract_corpus_parallel).
++        names = [ln.split("def ")[1].split("(")[0] for ln in user_text.splitlines() if ln.startswith("def ")]
++        nodes = [{"id": n, "label": n, "type": "function"} for n in names] or [{"id": "n", "label": "n", "type": "function"}]
++        events = [("response.output_text.delta", {"delta": json.dumps({"nodes": nodes, "edges": []})}), _completed_event()]
++        return _FakeResponse(_sse_bytes(events))
++
++    seen_workers = []
++    real_executor = llm.ThreadPoolExecutor
++
++    def spy_executor(max_workers=None, **kwargs):
++        seen_workers.append(max_workers)
++        return real_executor(max_workers=max_workers, **kwargs)
++
++    with patch.object(openai_oauth.urllib.request, "urlopen", side_effect=fake_urlopen), \
++         patch.object(llm, "ThreadPoolExecutor", side_effect=spy_executor), \
++         patch.object(llm.time, "sleep"):
++        llm.extract_corpus_parallel(files, backend="openai-oauth", root=tmp_path,
++                                    token_budget=None, chunk_size=1, max_concurrency=4)
++    return seen_workers
++
++
++def test_parallel_forced_serial_by_default(tmp_path, monkeypatch):
++    # workers == 1 takes the no-thread-pool sequential path in extract_corpus_parallel.
++    assert _run_parallel(tmp_path, monkeypatch, parallel_env=False) == []
++
++
++def test_parallel_env_enables_concurrency(tmp_path, monkeypatch):
++    assert _run_parallel(tmp_path, monkeypatch, parallel_env=True) == [3]
+\ No newline at end of file
+-- 
+2.46.2
+
